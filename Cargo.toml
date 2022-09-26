@@ -1,0 +1,21 @@
+[package]
+name = "sys"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zbus = "*"
+futures = "*"
+clap = { version = "3.2.22", features = ["derive", "env"] }
+tokio = { version = "*", features = ["full"] } # async runtime (held back by solana-client)
+zbus_systemd = { version = "0.0.5", features = ["systemd1"] }
+regex = "1.6.0"
+itertools = "0.10.5"
+strum = { version = "0.24.1", features = ["derive"] }
+dialoguer = { version = "0.10.2", features = ["fuzzy-select", "completion", "history"] }
+console = "0.15.1"
+prettytable-rs = "0.9.0"
+comfy-table = "6.1.0"
+
+[patch.crates-io]
+comfy-table = { git = 'https://github.com/blueForestIcarus/comfy-table.git' }
