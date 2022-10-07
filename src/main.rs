@@ -1,16 +1,16 @@
 //! remember, the d in systemd stands for demented
-use std::{collections::BTreeMap, fmt::format, process::{abort, exit}};
+use std::{collections::BTreeMap, fmt::format, process::{abort, exit}, str::FromStr};
 
 use clap::{arg, value_parser, ArgAction, ArgGroup, Command, Parser, ValueEnum};
-use console::StyledObject;
+use console::{StyledObject, Style};
 use futures::future::join_all;
 use itertools::Itertools;
 use regex::Regex;
-use zbus::{zvariant::OwnedObjectPath, Connection, ProxyDefault};
-use zbus_systemd::systemd1::{ManagerProxy, UnitProxy};
+use zbus::{zvariant::OwnedObjectPath, Connection, ProxyDefault, ConnectionBuilder};
+use zbus_systemd::{systemd1::{ManagerProxy, UnitProxy}, zbus::Address};
 
 #[derive(Parser, Debug)]
-#[clap(version, about, long_about = None)]
+#[clap(version, arg_required_else_help(true), about, long_about = None)]
 /*#[clap(group(
     ArgGroup::new("daemon-args")
         .args(&["daemon", "user_only", "system_only"]),
@@ -21,6 +21,9 @@ struct ArgSpec {
 
     #[clap(long = "debug-clap", env = "DEBUG_CLAP")]
     debug_clap: bool,
+
+    #[clap(long = "no-abbr")] //TODO replace
+    no_abbr : bool,
 
     #[clap(short, long)]
     force: bool,
@@ -47,18 +50,12 @@ struct ArgSpec {
     #[clap(short = 'R', long)]
     restart: bool,
 
-    #[clap(short = 'Q', long)]
+    #[clap(short = 'Q', long, alias="query")]
     status: bool,
-    #[clap(short = 'L', long)]
+    #[clap(short = 'L', long, alias="logs")]
     journal: bool,
 
-    #[clap(short = 'r', action=ArgAction::Count)]
-    reload_shorthand: u8,
-
-    #[clap(long)]
-    reload: bool,
-
-    #[clap(long)]
+    #[clap(short = 'r', long="daemon-reload")]
     daemon_reload: bool,
 
     #[clap(action = ArgAction::Append)]
@@ -83,6 +80,15 @@ struct ArgSpec {
 
     #[clap(short = 'q', long = "quiet")]
     quiet: bool,
+
+    #[clap(short = 's', long = "state", value_enum)]
+    status_filter : Vec<StatusOpt>,
+
+    //#[clap(short = 'a', long = "and", value_enum)]
+    //status_filtera : Vec<StatusOpt>,
+
+    #[clap(short = 'x', long = "exclude", value_enum)]
+    status_filterx : Vec<StatusOpt>,
 }
 
 #[derive(Debug, ValueEnum, Clone)]
@@ -151,18 +157,139 @@ impl TypeOpt {
     }
 }
 
+#[derive(Debug, ValueEnum, Clone, Copy, strum::EnumString, strum::Display, PartialEq, Eq, PartialOrd, Ord)]
+#[strum(serialize_all="kebab-case")]
+#[strum(ascii_case_insensitive)]
+enum StatusOpt{
+    Loaded,
+    NotFound,
+    BadSetting,
+
+    Active,
+    Inactive,
+
+    Failed,
+    Dead,
+    Running,
+    Plugged,
+    Mounted,
+    Waiting,
+    Exited,
+    Listening,
+    StatusActive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StatusOptType{
+    Loaded,
+    Active,
+    Status,
+}
+
+impl StatusOpt {
+    fn get_type(&self) -> StatusOptType{
+        match self {
+            StatusOpt::Active | StatusOpt::Inactive => StatusOptType::Active,
+            StatusOpt::NotFound | StatusOpt::Loaded | StatusOpt::BadSetting => StatusOptType::Loaded,
+            _ => StatusOptType::Status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StatusFields<T> {
+    pub loaded : T,
+    pub active : T,
+    pub status : T
+}
+
+type StatusFilter = StatusFields<Vec<StatusOpt>>;
+impl StatusFilter {
+    fn filter_includes(&self, unit : &ListUnitsItem) -> bool{
+        //match by any
+        (self.loaded.is_empty() && self.active.is_empty() && self.status.is_empty()) ||
+        (
+            self.loaded.contains(&unit.loaded) ||
+            self.active.contains(&unit.active) ||
+            self.status.contains(&unit.status)
+        )
+    }
+
+    /* 
+    fn filter_and(&self, unit : &ListUnitsItem) -> bool{
+        //match by all
+        (self.loaded.is_empty() && self.active.is_empty() && self.status.is_empty()) ||
+        (
+            self.loaded.contains(&unit.loaded) &&
+            self.active.contains(&unit.active) &&
+            self.status.contains(&unit.status) 
+        )
+    }
+    */
+
+    fn filter_excludes(&self, unit : &ListUnitsItem) -> bool{
+        //match by none
+        (self.loaded.is_empty() && self.active.is_empty() && self.status.is_empty()) ||
+        (
+            (! self.loaded.contains(&unit.loaded)) &&
+            (! self.active.contains(&unit.active)) &&
+            (! self.status.contains(&unit.status))
+        )
+    }
+}
+
+fn split_status_list(l : &[StatusOpt]) -> StatusFilter {
+    let mut ret = StatusFields::<Vec<StatusOpt>>::default();
+
+    for state in l {
+        if *state == StatusOpt::StatusActive {
+            ret.status.push(StatusOpt::Active)
+        }else{
+            match state.get_type() {
+                StatusOptType::Active => { ret.active.push(*state) }
+                StatusOptType::Loaded => { ret.loaded.push(*state) }
+                StatusOptType::Status => { ret.status.push(*state) }
+            }
+        }
+    }
+    ret
+}
+
+fn colorize_status(text : &str) -> Style{
+    let style = Style::new();
+    match text {
+        "loaded" => style.dim(),
+        "not-found" => style.yellow(),
+        "active" => style,
+        "actives" => style,
+        "inactive" => style.dim(),
+        "failed" => style.red(),
+        "dead" => style.yellow(),
+        "running" => style.green(),
+        "plugged" => style,
+        "mounted" => style,
+        "waiting" => style.green().dim(),
+        "exited" => style.dim(),
+        "listening" => style.green().dim(),
+        _ => style,
+    }
+}
+
 #[derive(Debug, Clone)]
+#[allow(unused)]
 struct ListUnitsItem {
-    name: String,
-    desc: String,
-    loaded: String,
-    active: String,
-    plugged: String,
+    name: String, //0
+    desc: String, //1
+    loaded: StatusOpt, //2
+    active: StatusOpt, //3
+    status: StatusOpt, //4
     other_name: String,
     path: OwnedObjectPath,
     idk: u32,
     idk2: String,
     idk3: OwnedObjectPath,
+    unit_type: TypeOpt,
+    base_name: String,
 }
 
 impl
@@ -193,17 +320,48 @@ impl
             OwnedObjectPath,
         ),
     ) -> Self {
+        lazy_static::lazy_static!{
+            static ref TYPE_REGEX : Regex = Regex::new(r"(.*)\.([^.]*)$").unwrap();
+        }
+
+        let m = TYPE_REGEX
+            .captures(&t.0)
+            .unwrap_or_else(|| panic!("error extracting unit type {}", t.0));
+        
+        let base_name = m.get(1).unwrap().as_str().to_string();
+        let unit_type = m.get(2).unwrap().as_str();
+        let unit_type: TypeOpt = unit_type
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid unit type {}", unit_type));
+
+        let loaded: StatusOpt = t.2.as_str()
+            .try_into().ok()
+            .filter(|v : &StatusOpt| (v.get_type() == StatusOptType::Loaded) )
+            .unwrap_or_else(|| panic!("invalid unit loaded state {}", t.2));
+
+        let active: StatusOpt = t.3.as_str()
+            .try_into().ok()
+            .filter(|v : &StatusOpt| (v.get_type() == StatusOptType::Active || *v == StatusOpt::Failed ) )
+            .unwrap_or_else(|| panic!("invalid unit active state {}", t.3));
+
+        let status: StatusOpt = t.4.as_str()
+            .try_into().ok()
+            .filter(|v : &StatusOpt| (v.get_type() == StatusOptType::Status|| *v == StatusOpt::Active ) )
+            .unwrap_or_else(|| panic!("invalid unit status {}", t.4));
+
         ListUnitsItem {
             name: t.0,
             desc: t.1,
-            loaded: t.2,
-            active: t.3,
-            plugged: t.4,
+            loaded,
+            active,
+            status,
             other_name: t.5,
             path: t.6,
             idk: t.7,
             idk2: t.8,
             idk3: t.9,
+            unit_type,
+            base_name,
         }
     }
 }
@@ -245,6 +403,11 @@ async fn main() {
         v.append(&mut fixed_patterns);
         v
     };
+
+    let status_include = split_status_list(&args.status_filter);
+    let status_exclude = split_status_list(&args.status_filterx);
+    //let status_and = split_status_list(&args.status_filtera);
+
     //println!("{:?}", filters);
     #[derive(Debug, Clone, Copy, strum::Display, PartialEq, Eq, PartialOrd, Ord)]
     #[strum(serialize_all = "UPPERCASE")]
@@ -272,32 +435,95 @@ async fn main() {
         }
 
         let mut conns: Vec<(DaemonType, Connection)> = Vec::new();
-        if user {
-            let conn = Connection::session()
-                .await
-                .expect("could not connect to dbus user session");
-            conns.push((DaemonType::User, conn));
-        }
         if system {
             let conn = Connection::system()
                 .await
                 .expect("could not connect to dbus system session");
             conns.push((DaemonType::System, conn));
         }
+        if user {
+            if users::get_current_uid() == 0
+            {
+                let uid_res = std::env::var("SUDO_UID").map(|v| {
+                    let n : u32 = v.parse().expect("non numeric uid");
+                    n
+                });
+                let uid = 
+                    if let Ok(uid) = uid_res && uid != 0 {
+                        uid
+                    } else if system{
+                        //try to figure out with logind
+                        let _conn = &conns[0];
+                        //zbus_systemd::login1:: TODO
+                        todo!()
+                    } else {
+                        println!("ERROR: could not determine user uid");
+                        0
+                    };
+
+                
+                // honor XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+                let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|_|{
+                    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()
+                        .unwrap_or_else(|| format!("/run/user/{}", uid));
+                    format!("unix:path={}/bus", runtime_dir)
+                });
+                let address : Address = Address::from_str(&address).unwrap();
+                println!("connecting to {}", address);
+
+                users::switch::set_effective_uid(uid).expect("could not set euid");
+                let conn = ConnectionBuilder::address(address)
+                    .expect("blarg")
+                    .build()
+                    .await
+                    .unwrap_or_else(|e| panic!("could not connect to dbus user session (uid:{uid})\n{e}"));
+                conns.push((DaemonType::User, conn));
+                users::switch::set_effective_uid(0).unwrap();
+            } else {
+                // NOTE: i'm not sure what happens if there *is* a user session for root, like if you logged into a graphical session as root.
+                let conn = Connection::session()
+                    .await
+                    .expect("could not connect to dbus user session");
+                conns.push((DaemonType::User, conn));
+            }
+        }
         conns
     };
 
+    // used for print / prompt logic only atm
+    let mut actions : Vec<&'static str> = Vec::new();
+    if args.start {
+        actions.push("Start");
+    }
+    if args.stop {
+        actions.push("Stop");
+    }
+    if args.restart {
+        actions.push("Restart");
+    }
+    if args.enable {
+        actions.push("Enable");
+    }
+    if args.disable {
+        actions.push("Disable");
+    }
+
+    /*
+    if filters.is_empty(){
+        use clap::CommandFactory;
+        ArgSpec::command().print_help().unwrap();
+        exit(1);
+    }
+    */
+
+    #[allow(unused)]
     struct Unit<'a> {
         info: ListUnitsItem,
         daemon: DaemonType,
         //conn : &'a Connection,
         manager: ManagerProxy<'a>,
         proxy: UnitProxy<'a>,
-        unit_type: TypeOpt,
-        base_name: String,
     }
-
-    let type_regex = Regex::new(r"(.*)\.([^.]*)$").unwrap();
 
     let mut all_units : BTreeMap<DaemonType, Vec<Unit>> = Default::default();
     all_units.insert(DaemonType::User, Vec::new());
@@ -305,50 +531,42 @@ async fn main() {
 
     for (daemon, conn) in conns.iter() {
         let manager = ManagerProxy::new(conn).await.unwrap();
+
+        if args.daemon_reload {
+            //todo  zbus_systemd::systemd1::Reloading
+            println!("{} {daemon} daemon", console::style("reload").bold());
+            manager.reload().await
+                .unwrap_or_else(|e| panic!("problem reloading {daemon} daemon : {e}"))
+        }
+
         let units = manager.list_units().await.unwrap();
 
         let units = units
             .into_iter()
+            .map(ListUnitsItem::from)
             .filter(|unit| match args.multi {
-                true => filters.iter().any(|re| re.is_match(&unit.0)),
-                false => filters.iter().all(|re| re.is_match(&unit.0)),
-            }).filter_map(|unit| {
-                let typ = type_regex
-                    .captures(&unit.0)
-                    .unwrap_or_else(|| panic!("error extracting unit type {}", unit.0))
-                    .get(2)
-                    .unwrap()
-                    .as_str();
-
-                let typ: TypeOpt = typ
-                    .try_into()
-                    .unwrap_or_else(|_| panic!("invalid unit type {}", typ));
-                if args.types.contains(&typ) || args.types.is_empty(){
-                    Some((unit, typ))
-                }else{
-                    None
-                }
+                true => filters.iter().any(|re| re.is_match(&unit.name)),
+                false => filters.iter().all(|re| re.is_match(&unit.name)),
+            }).filter(|unit| {
+                status_include.filter_includes(unit) && 
+                status_exclude.filter_excludes(unit) //&&
+                //status_and.filter_and(unit)
+            }).filter(|unit| {
+                args.types.contains(&unit.unit_type) || args.types.is_empty()
             })
-            .map(|(unit,typ)| async {
-                let info: ListUnitsItem = unit.into();
+            .map(|unit| async {
                 let proxy = UnitProxy::builder(conn)
-                    .path(info.path.clone())
+                    .path(unit.path.clone())
                     .unwrap()
                     .build()
                     .await
                     .unwrap();
-                let base_name = type_regex
-                    .captures(&info.name).unwrap()
-                    .get(1).unwrap().as_str().to_string();
 
                 Unit {
-                    info,
+                    info : unit,
                     daemon: *daemon,
-                    unit_type : typ,
-
                     manager: manager.clone(),
                     proxy,
-                    base_name
                 }
             });
 
@@ -357,11 +575,25 @@ async fn main() {
         all_units.get_mut(daemon).unwrap().extend(units);
     }
 
-    if all_units.values().all(Vec::is_empty){
-        println!("Filters [{}] matched no units.", filters.iter().map(|re| format!("\'{:?}\'", re)).join( if args.multi {" || "} else {" && "}));
-        exit(1)
+    /* bail conditions*/
+    {
+        if !actions.is_empty() && filters.is_empty(){
+            println!("ERROR: must specify unit or unit pattern for {}", actions.join(", "));
+            exit(1);
+        }
+        
+        //TODO more consistant logic for when to print
+        if filters.is_empty() && args.daemon_reload {
+            exit(1);
+        }
+
+        if all_units.values().all(Vec::is_empty){
+            println!("Filters [{}] matched no units.", filters.iter().map(|re| format!("\'{:?}\'", re)).join( if args.multi {" || "} else {" && "}));
+            exit(1)
+        }
     }
 
+    /* print table */
     {
         use comfy_table::{
             Table, Row, Attribute as Attr, Cell, presets, ContentArrangement, ColumnConstraint
@@ -385,50 +617,51 @@ async fn main() {
                 row.add_cell(
                     Cell::new(
                         format!("{}-{}-{}", 
-                            &unit.info.loaded.chars().nth(0).unwrap(),
-                            &unit.info.active.chars().nth(0).unwrap(),
-                            &unit.info.plugged.chars().nth(0).unwrap()
+                            colorize_status(&unit.info.loaded.to_string()).apply_to(&unit.info.loaded.to_string().chars().nth(0).unwrap()),
+                            colorize_status(&unit.info.active.to_string()).apply_to(&unit.info.active.to_string().chars().nth(0).unwrap()),
+                            colorize_status(&unit.info.status.to_string()).apply_to(&unit.info.status.to_string().chars().nth(0).unwrap())
                         )
                     )
-                    .add_attribute(Attr::Dim)
-                    .add_attribute(Attr::Bold)
                 );
 
 
             
                 //2
                 row.add_cell(
-                    Cell::new(format!("{}", unit.unit_type.color_str(false))) 
+                    Cell::new(format!("{}", unit.info.unit_type.color_str(false))) 
                 );
 
                 //3
                 row.add_cell(
                     Cell::new(format!(
                         "{}{}",
-                        unit.base_name,
-                        unit.unit_type.color_str(true)
+                        unit.info.base_name,
+                        unit.info.unit_type.color_str(true)
                     ))
                 );
 
                 //4
                 row.add_cell(
-                    Cell::new(unit.base_name.to_string())
+                    Cell::new(unit.info.base_name.to_string())
                 );
 
                 //5
                 row.add_cell(
-                    Cell::new(&unit.info.loaded) 
-                    .add_attribute(Attr::Dim)
+                    Cell::new(
+                        colorize_status(&unit.info.loaded.to_string()).apply_to(&unit.info.loaded)
+                    ) 
                 );
                 //6
                 row.add_cell(
-                    Cell::new(&unit.info.active)
-                    .add_attribute(Attr::Dim)
+                    Cell::new(
+                        colorize_status(&unit.info.active.to_string()).apply_to(&unit.info.active)
+                    )
                 );
                 //7
                 row.add_cell(
-                    Cell::new(&unit.info.plugged)
-                    .add_attribute(Attr::Dim)
+                    Cell::new(
+                        colorize_status(&unit.info.status.to_string()).apply_to(&unit.info.status)
+                    )
                 );
 
                 //8
@@ -447,7 +680,8 @@ async fn main() {
         }
 
         let width = console::Term::stdout().size_checked().unwrap_or((0,200)).1 as usize;
-        let abbreviate = true; //( longest + 40 ) > width;
+        let abbreviate = ( longest + 40 ) > width || args.verbose < 3;
+        let abbreviate = abbreviate && ! args.no_abbr;
 
         // if daemon specified remove daemon column
         if conns.len() < 2 {
@@ -489,25 +723,12 @@ async fn main() {
 
         // if wraps, and not verbose remove desc
         // if still wraps swap with abbreviated
-        println!("{}", table);
-    }
 
 
-    let mut actions : Vec<&'static str> = Vec::new();
-    if args.start {
-        actions.push("Start");
-    }
-    if args.stop {
-        actions.push("Stop");
-    }
-    if args.restart {
-        actions.push("Restart");
-    }
-    if args.enable {
-        actions.push("Enable");
-    }
-    if args.disable {
-        actions.push("Disable");
+        if ! ( args.quiet && (args.force || table.row_iter().count() < 2))
+        {
+            println!("{}", table);
+        }
     }
 
     #[allow(clippy::collapsible_if)]
@@ -547,16 +768,17 @@ async fn main() {
             */
             println!("{:?}", res);
         }
+
+        exit(0);
     }
 
-
-    /*
+    // Execute actions
     if args.enable && args.disable {
-
+        todo!();
     } else if args.enable {
-
+        todo!();
     } else if args.disable {
-        unit.manager.enable_unit_files(unit.proxy, args.runtime, args.force)
+        todo!();
     }
-    */
+    
 }
