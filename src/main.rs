@@ -773,12 +773,20 @@ async fn main() {
     }
 
     // Execute actions
-    if args.enable && args.disable {
-        todo!();
-    } else if args.enable {
-        todo!();
-    } else if args.disable {
-        todo!();
+    // enable disable
+    if args.enable || args.disable {
+        for unit in all_units.iter().flat_map(|v|v.1){
+            let path = unit.proxy.fragment_path().await.unwrap();
+
+            if args.enable && args.disable {
+                unit.manager.reenable_unit_files(vec![path], false, args.force).await.unwrap();
+            } else if args.enable {
+                unit.manager.enable_unit_files(vec![path], false, args.force).await.unwrap();
+            } else if args.disable {
+                unit.manager.disable_unit_files(vec![path], false).await.unwrap();
+            }
+        }
     }
-    
+
+    // default job mode https://www.freedesktop.org/software/systemd/man/systemctl.html#--job-mode=
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-#systemctl wrapper
+#systemctl wrapper (the bash script I am porting)
 
 UNITS=()
 ACTION=()
