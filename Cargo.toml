@@ -19,7 +19,8 @@ comfy-table = "6.1.0"
 lazy_static = "*"
 users = "*"
 tracing = "*"
+tracing-subscriber = "*"
 
 [patch.crates-io]
 comfy-table = { git = 'https://github.com/blueForestIcarus/comfy-table.git' }
-zbus = { git = 'https://gitlab.freedesktop.org/blueForestIcarus1/zbus.git' }
+#zbus = { git = 'https://gitlab.freedesktop.org/blueForestIcarus1/zbus.git' }
