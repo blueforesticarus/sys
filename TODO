@@ -1,0 +1,28 @@
+Unsolved problems:
+1. How to deal with unloaded units
+    - systemctl start/status/etc seems to directly call into systemd, but we can't do this because of globbing
+    - need to invoke load-unit-files, and have that play nice with load-units
+    - filtering means we need to load unloaded unit files that match the filter
+    - for this reason it makes sense to default to filtering out unloaded units for generic queries, so we don't have to load it every time.
+
+2. Logging startup
+    - there are 2 differnt things we want to log
+        a. journalctl logs from the application
+        b. systemd internals
+    - with want a hierarchical multiprogress spinner
+    - a unit is a tracing span, it has a subspan for journalctl and a subspan for systemd state updates. The journal may be a child of the state updates idk.
+    - the unit span fits into a hierarchy of jobs (this restarts because of this because of that) with the command line actions as the root span, and the matching units under directly under them.
+    - a flag to invert action order, and make each unit acted on independantly would also be good.
+
+    - sys should also be able to watch and log systemd actions comming from elsewhere. So if you have log running, and systemctl restarted from another terminal, the sys logger would show the same output as if you used sys to restart it (to the extent possible.)
+        - to this end we want to be minimally dependant on internal state, and more or less just respond to journald and systemd dbus signals.
+
+3. representing units.
+    - What to show and how to show it is an issue for down the line, for now a good goal is to show everything possible.
+    - I want a representation of a unit's entire state and configuration.
+    - can we reconstruct the unit file from the dbus exposed state.
+    - fully seperate state, and config. have a good representation for the relationships between units.
+    - if possible fetch what package unit comes from (on nix probably easy), or if it is custom.
+
+4. dealing with template/generated units
+5. tab complete
