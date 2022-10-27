@@ -1,21 +1,13 @@
 //! remember, the d in systemd stands for demented
 use std::{
     collections::BTreeMap,
-    fmt::format,
     path::PathBuf,
-    process::{
-        abort,
-        exit,
-    },
+    process::exit,
     str::FromStr,
 };
 
 use clap::{
-    arg,
-    value_parser,
     ArgAction,
-    ArgGroup,
-    Command,
     Parser,
     ValueEnum,
 };
@@ -23,23 +15,18 @@ use console::{
     Style,
     StyledObject,
 };
-use futures::{
-    future::join_all,
-    StreamExt,
-};
+use futures::future::join_all;
 use itertools::Itertools;
 use regex::Regex;
 use tracing::{
     info,
     span,
     Level,
-    Span,
 };
 use zbus::{
     zvariant::OwnedObjectPath,
     Connection,
     ConnectionBuilder,
-    ProxyDefault,
 };
 use zbus_systemd::{
     systemd1::{
@@ -425,7 +412,7 @@ impl
                 .try_into()
                 .ok()
                 .filter(|v: &StatusOpt| {
-                    (v.get_type() == StatusOptType::Active || *v == StatusOpt::Failed)
+                    v.get_type() == StatusOptType::Active || *v == StatusOpt::Failed
                 })
                 .unwrap_or_else(|| panic!("invalid unit active state {}", t.3));
 
@@ -434,7 +421,7 @@ impl
                 .try_into()
                 .ok()
                 .filter(|v: &StatusOpt| {
-                    (v.get_type() == StatusOptType::Status || *v == StatusOpt::Active)
+                    v.get_type() == StatusOptType::Status || *v == StatusOpt::Active
                 })
                 .unwrap_or_else(|| panic!("invalid unit status {}", t.4));
 
