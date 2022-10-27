@@ -1,6 +1,11 @@
 //! remember, the d in systemd stands for demented
 use std::{
-    collections::BTreeMap,
+    any::Any,
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
+    fmt::Display,
     path::PathBuf,
     process::exit,
     str::FromStr,
@@ -197,6 +202,7 @@ enum StatusOpt {
     Loaded,
     NotFound,
     BadSetting,
+    Masked,
 
     Active,
     Inactive,
@@ -217,14 +223,18 @@ enum StatusOpt {
 #[strum(ascii_case_insensitive)]
 enum UnitFileStatus {
     Linked,
+    LinkedRuntime,
     Transient,
     Masked,
     Generated,
     EnabledRuntime,
     Enabled,
+    Disabled,
     Alias,
+    Static,
 }
 
+#[derive(Debug, Clone)]
 struct UnitFile {
     path: PathBuf,
     name: String,
@@ -233,9 +243,10 @@ struct UnitFile {
 }
 impl UnitFile {
     fn new((path, status): (String, String)) -> Self {
-        let status = UnitFileStatus::from_str(&status).unwrap();
+        let status = UnitFileStatus::from_str(&status)
+            .unwrap_or_else(|e| panic!("{e}\nbad unit file status {status}"));
         let path = PathBuf::from_str(&path).unwrap();
-        let name: String = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let name: String = path.file_name().unwrap().to_str().unwrap().to_string();
         let typ: TypeOpt = FromStr::from_str(path.extension().unwrap().to_str().unwrap()).unwrap();
 
         UnitFile {
@@ -342,7 +353,6 @@ fn colorize_status(text: &str) -> Style {
 }
 
 #[derive(Debug, Clone)]
-#[allow(unused)]
 struct ListUnitsItem {
     name: String,      //0
     desc: String,      //1
@@ -356,6 +366,49 @@ struct ListUnitsItem {
     idk3: OwnedObjectPath,
     unit_type: TypeOpt,
     base_name: String,
+}
+
+lazy_static::lazy_static! {
+    static ref TYPE_REGEX : Regex = Regex::new(r"(.*)\.([^.]*)$").unwrap();
+}
+
+impl ListUnitsItem {
+    async fn from_proxy(proxy: &UnitProxy<'_>) -> Self {
+        let name = proxy.names().await.unwrap().first().unwrap().clone();
+        let m = TYPE_REGEX
+            .captures(&name)
+            .unwrap_or_else(|| panic!("error extracting unit type {}", name));
+        let base_name = m.get(1).unwrap().as_str().to_string();
+        let unit_type = m.get(2).unwrap().as_str();
+
+        let unit_type: TypeOpt = unit_type
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid unit type {}", unit_type));
+
+        Self {
+            name,
+            desc: proxy.description().await.unwrap().clone(),
+            loaded: {
+                let state = proxy.load_state().await.unwrap();
+                state.parse().unwrap_or_else(|e| panic!("{e} {state}"))
+            },
+            active: {
+                let state = proxy.active_state().await.unwrap();
+                state.parse().unwrap_or_else(|e| panic!("{e} {state}"))
+            },
+            status: {
+                let state = proxy.sub_state().await.unwrap();
+                state.parse().unwrap_or_else(|e| panic!("{e} {state}"))
+            },
+            other_name: Default::default(),
+            path: Default::default(), //XXX
+            idk: Default::default(),
+            idk2: Default::default(),
+            idk3: Default::default(),
+            unit_type,
+            base_name,
+        }
+    }
 }
 
 impl
@@ -386,10 +439,6 @@ impl
             OwnedObjectPath,
         ),
     ) -> Self {
-        lazy_static::lazy_static! {
-            static ref TYPE_REGEX : Regex = Regex::new(r"(.*)\.([^.]*)$").unwrap();
-        }
-
         let m = TYPE_REGEX
             .captures(&t.0)
             .unwrap_or_else(|| panic!("error extracting unit type {}", t.0));
@@ -649,7 +698,6 @@ async fn main() {
         }
 
         let units = manager.list_units().await.unwrap();
-
         let units = units
             .into_iter()
             .map(ListUnitsItem::from)
@@ -681,9 +729,63 @@ async fn main() {
                     manager: manager.clone(),
                     proxy,
                 }
-            });
+            })
+            .collect_vec();
 
         let mut units = join_all(units).await;
+
+        let unit_file_names: HashSet<_> = units.iter().map(|v| v.info.name.clone()).collect();
+
+        // unloaded unit support
+        let unit_files = manager.list_unit_files().await.unwrap();
+        let unit_files = unit_files
+            .into_iter()
+            .map(UnitFile::new)
+            .filter(|unit| !unit_file_names.contains(&unit.name))
+            .filter(|unit| match args.multi {
+                true => filters.iter().any(|re| re.is_match(&unit.name)),
+                false => filters.iter().all(|re| re.is_match(&unit.name)),
+            })
+            .filter(|unit| args.types.contains(&unit.typ) || args.types.is_empty())
+            .filter(|u| {
+                if args.debug {
+                    println!("{:#?}", &u);
+                }
+                true
+            })
+            .map(|v| manager.load_unit(v.name))
+            .collect_vec();
+
+        let unit_files_loaded = join_all(unit_files)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|unit| async {
+                let unit = unit;
+                let proxy = UnitProxy::builder(conn)
+                    .path(unit.clone())
+                    .unwrap()
+                    .build()
+                    .await?;
+
+                if args.debug {
+                    println!("{:#?}", &unit);
+                }
+
+                let info = ListUnitsItem::from_proxy(&proxy).await;
+
+                Ok::<Unit, zbus::Error>(Unit {
+                    info,
+                    daemon: *daemon,
+                    manager: manager.clone(),
+                    proxy,
+                })
+            })
+            .collect_vec();
+
+        let unit_files_loaded = join_all(unit_files_loaded).await;
+        units.extend(unit_files_loaded.into_iter().filter_map(Result::ok));
+
         units.sort_by_key(|v| v.info.name.clone());
         all_units.get_mut(daemon).unwrap().extend(units);
     }
